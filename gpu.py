@@ -1,8 +1,51 @@
 # 导入YOLOv8核心库
 from ultralytics import YOLO
 import torch
+import torch.nn as nn
 import os  # 用于校验文件是否存在
 print(os.getcwd())
+
+# ====================== 注意力机制模块：SE Attention ======================
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation 注意力模块"""
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+# ====================== 添加SE注意力的YOLOv8 C2f模块修改 ======================
+def add_se_to_model(model):
+    """将SE注意力模块注入到YOLOv8的C2f模块中"""
+    for name, module in model.model.named_modules():
+        if hasattr(module, 'cv2') and 'c2f' in name.lower():
+            # 在C2f模块的Bottleneck后添加SE模块
+            if hasattr(module, 'm'):
+                # 为每个bottleneck添加SE注意力
+                for i, bottleneck in enumerate(module.m):
+                    # 在bottleneck的卷积层后添加SE
+                    if hasattr(bottleneck, 'cv2'):
+                        channels = bottleneck.cv2.out_channels
+                        se = SEBlock(channels)
+                        # 将SE模块作为属性附加到bottleneck
+                        bottleneck.se = se
+                        # 修改forward方法
+                        original_forward = bottleneck.forward
+                        def new_forward(x, orig=original_forward, se=bottleneck.se):
+                            return se(orig(x))
+                        bottleneck.forward = new_forward
+    print("✓ 已为模型添加SE注意力机制")
+    return model
 
 # ====================== 关键修复：适配ultralytics 8.4.24的禁用下载方案 ======================
 # 方案1：屏蔽requests库的下载请求（兜底，彻底阻止所有网络请求）
@@ -35,10 +78,10 @@ print(f"当前使用GPU: {current_gpu} ({gpu_name})")
 print(f"当前运行设备: GPU (CUDA加速版本)\n")
 
 # ====================== 第二步：核心配置（路径保持不变，适配GPU）======================
-DATA_YAML_PATH = r"data_yms_max/test.yaml"  # 数据集配置
-MODEL_PATH = r"data_yms_max/yolov8s.pt"     # 本地预训练模型路径
-SAVE_DIR = r"data_yms_max/uav_campus_train"  # 训练结果保存路径
-TEST_IMG_PATH = r"data_yms_max/images/val"  # 测试集路径
+DATA_YAML_PATH = r"data_yms/test.yaml"  # 数据集配置
+MODEL_PATH = r"data_yms/yolov8s.pt"     # 本地预训练模型路径
+SAVE_DIR = r"data_yms/uav_campus_train"  # 训练结果保存路径
+TEST_IMG_PATH = r"data_yms/images/val"  # 测试集路径
 
 # 关键：校验本地模型/数据集路径是否存在，避免报错
 if not os.path.exists(MODEL_PATH):
@@ -53,14 +96,17 @@ IMG_SIZE = 640       # 输入图像尺寸（GPU可支持更大，如800/1024）
 BATCH_SIZE = 16      # Tesla T4 16G显存适配（32会OOM，16是安全值）
 DEVICE = 0           # 使用第0块GPU（多GPU可设为[0,1]，CPU是"cpu"）
 
-# ====================== 第四步：加载本地模型+开始GPU训练 ======================
-print("===== 加载本地YOLOv8s模型，开始GPU训练 =====")
+# ====================== 第四步：加载本地模型+添加注意力机制+开始GPU训练 ======================
+print("===== 加载本地YOLOv8s模型，添加注意力机制 =====")
 model = YOLO(MODEL_PATH)  # 加载本地模型，自动移到GPU
 
+# 添加SE注意力机制
+model = add_se_to_model(model)
+
 # 先定义关键常量（建议根据300张样本调整）
-EPOCHS = 150  # 小数据集适当增加轮次，让模型充分学习
-IMG_SIZE = 800  # 增大分辨率，提升框回归精度（GPU算力足够支撑）
-BATCH_SIZE = 8  # 16→8，小数据集batch减小，梯度更新更稳定
+EPOCHS = 5  # 快速测试：降低轮次快速走完流程
+IMG_SIZE = 640  # 降低分辨率，加快训练速度
+BATCH_SIZE = 8  # 小数据集batch减小，梯度更新更稳定
 DEVICE = 0  # 你的GPU设备ID
 
 # 优化后的训练参数（核心改动已标注）
@@ -83,7 +129,7 @@ train_results = model.train(
     weight_decay=0.0005,
     workers=4,
     pretrained=True,
-    amp=True,          # 保留：GPU混合精度训练，不改动
+    amp=False,         # 【改动】禁用AMP混合精度，避免下载检查
     cache="ram",       # 保留：内存缓存，不占用显存
     # 新增2个关键参数：提升框回归精度
     box=8.0,           # 【新增】框损失权重（默认7.5→8.0，强化框回归）
